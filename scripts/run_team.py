@@ -27,11 +27,12 @@ if os.path.exists("project"):
 os.makedirs("project", exist_ok=True)
 
 dev_team = Crew(
-    agents=[product_manager, architect, developer, qa_security_engineer, devops_engineer],
-    tasks=[task_prd, task_arch, task_dev, task_qa, task_devops],
+    agents=[pm, architect, developer, qa, devops],
+    tasks=[pm_task, architect_task, dev_task, qa_task, devops_task],
     process=Process.sequential,
-    max_rpm=12,  # <-- Throttles all agents to max 12 requests/minute (under the 15 RPM free limit)
-    verbose=True
+    max_rpm=5,
+    step_callback=rate_limit_pause,
+    verbose=True,
 )
 
 
