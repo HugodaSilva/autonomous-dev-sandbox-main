@@ -6,6 +6,12 @@ from github import Github, Auth
 from crewai import Agent, Task, Crew, Process, LLM
 from crewai.tools import tool
 from crewai_tools import FileWriterTool, FileReadTool
+import time
+from crewai import Agent, Crew, Process, Task
+
+def rate_limit_pause(step_output):
+    """Pauses briefly between agent steps to stay under Gemini's 15 RPM Free Tier cap."""
+    time.sleep(6)
 
 # ---------------------------------------------------------
 # 1. Load GitHub Actions Context & Secrets
