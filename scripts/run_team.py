@@ -1,11 +1,11 @@
 import os
 import re
-import time
 import subprocess
-from github import Github, Auth, GithubException
-from crewai import Agent, Task, Crew, Process, LLM
+import time
+from crewai import Agent, Crew, LLM, Process, Task
 from crewai.tools import tool
-from crewai_tools import FileReadTool, DirectoryReadTool
+from crewai_tools import FileReadTool
+from github import Auth, Github, GithubException
 
 # ---------------------------------------------------------
 # 1. Load GitHub Actions Context & Secrets
@@ -49,23 +49,32 @@ def strip_markdown_fences(content: str) -> str:
     return content
 
 
+def truncate_output(text: str, max_lines: int = 60) -> str:
+    """Caps tool stdout/stderr to avoid blowing Gemini Free Tier Tokens-Per-Minute limits."""
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text
+    return "\n".join(["...(truncated)..."] + lines[-max_lines:])
+
+
+# Set num_retries=0 so LiteLLM doesn't rapid-fire 429 retries outside CrewAI's max_rpm limiter
 llm = LLM(
     model="gemini/gemini-3.1-flash-lite-preview",
     temperature=0.1,
-    max_retries=6,
-    timeout=120
+    num_retries=0,
+    timeout=120,
 )
 
 # ---------------------------------------------------------
 # 2. Define Real Tools (Repo Files, Quality Gate, GitHub PR)
 # ---------------------------------------------------------
-dir_reader = DirectoryReadTool(directory=".")
 file_reader = FileReadTool()
 
 
 @tool("Safe File Writer")
 def safe_write_file(file_path: str, content: str) -> str:
     """Creates or updates a file at the exact repository path (e.g. src/catalog/repository.py)."""
+    time.sleep(3)
     clean_path = os.path.normpath(file_path).lstrip("/")
     if clean_path.startswith(PROTECTED_PREFIXES) or clean_path == "requirements.txt":
         return f"ERROR: '{clean_path}' is a protected orchestration file and cannot be modified."
@@ -73,8 +82,8 @@ def safe_write_file(file_path: str, content: str) -> str:
     dir_name = os.path.dirname(clean_path)
     if dir_name:
         os.makedirs(dir_name, exist_ok=True)
-        # Ensure every intermediate Python package directory has an __init__.py so pytest imports work reliably
-        if clean_path.endswith(".py"):
+        # Ensure intermediate Python package directories (excluding tests/) have __init__.py
+        if clean_path.endswith(".py") and not clean_path.startswith("tests"):
             parts = dir_name.split(os.sep)
             for i in range(1, len(parts) + 1):
                 pkg_dir = os.sep.join(parts[:i])
@@ -92,28 +101,29 @@ def safe_write_file(file_path: str, content: str) -> str:
 @tool("Run Quality Gate")
 def run_quality_gate(target_dir: str = ".") -> str:
     """Auto-formats with Ruff, then runs Ruff linter, Bandit security scanner, and Pytest."""
-    # Step 1: Auto-fix import sorting (I001) and formatting so the agent doesn't burn RPM on trivial style fixes
+    time.sleep(3)
+    # Step 1: Auto-fix import sorting (I001) and formatting so the agent doesn't burn RPM on style fixes
     subprocess.run(
         ["ruff", "check", "--fix", target_dir, "--exclude", "scripts,.github"],
         capture_output=True,
-        text=True
+        text=True,
     )
     subprocess.run(
         ["ruff", "format", target_dir, "--exclude", "scripts,.github"],
         capture_output=True,
-        text=True
+        text=True,
     )
 
     # Step 2: Run strict verification checks
     ruff_res = subprocess.run(
         ["ruff", "check", target_dir, "--exclude", "scripts,.github"],
         capture_output=True,
-        text=True
+        text=True,
     )
     bandit_res = subprocess.run(
         ["bandit", "-r", target_dir, "-x", "./scripts,./.github,*test*"],
         capture_output=True,
-        text=True
+        text=True,
     )
 
     # Ensure repository root is on PYTHONPATH so `from src.pkg.mod import ...` always resolves
@@ -125,7 +135,7 @@ def run_quality_gate(target_dir: str = ".") -> str:
         ["pytest", "-v", "--ignore=scripts"],
         capture_output=True,
         text=True,
-        env=pytest_env
+        env=pytest_env,
     )
 
     overall_passed = (
@@ -134,11 +144,15 @@ def run_quality_gate(target_dir: str = ".") -> str:
         and pytest_res.returncode == 0
     )
 
+    ruff_out = truncate_output(f"{ruff_res.stdout}{ruff_res.stderr}")
+    bandit_out = truncate_output(f"{bandit_res.stdout}{bandit_res.stderr}")
+    pytest_out = truncate_output(f"{pytest_res.stdout}{pytest_res.stderr}")
+
     return (
         f"OVERALL_PASSED: {overall_passed}\n"
-        f"--- RUFF LINTER (Exit {ruff_res.returncode}) ---\n{ruff_res.stdout}{ruff_res.stderr}\n"
-        f"--- BANDIT SECURITY (Exit {bandit_res.returncode}) ---\n{bandit_res.stdout}{bandit_res.stderr}\n"
-        f"--- PYTEST SUITE (Exit {pytest_res.returncode}) ---\n{pytest_res.stdout}{pytest_res.stderr}"
+        f"--- RUFF LINTER (Exit {ruff_res.returncode}) ---\n{ruff_out}\n"
+        f"--- BANDIT SECURITY (Exit {bandit_res.returncode}) ---\n{bandit_out}\n"
+        f"--- PYTEST SUITE (Exit {pytest_res.returncode}) ---\n{pytest_out}"
     )
 
 
@@ -150,7 +164,7 @@ def create_github_pr(branch_name: str, pr_title: str, pr_body: str) -> str:
             ["git", "status", "--porcelain", "-uall"],
             capture_output=True,
             text=True,
-            check=True
+            check=True,
         )
         changed_files = []
         for line in status_res.stdout.splitlines():
@@ -186,7 +200,7 @@ def create_github_pr(branch_name: str, pr_title: str, pr_body: str) -> str:
                     message=f"fix/feat(issue-{ISSUE_NUMBER}): update {repo_path}",
                     content=content,
                     sha=existing.sha,
-                    branch=safe_branch
+                    branch=safe_branch,
                 )
             except GithubException as ge:
                 if ge.status == 404:
@@ -194,7 +208,7 @@ def create_github_pr(branch_name: str, pr_title: str, pr_body: str) -> str:
                         path=repo_path,
                         message=f"feat(issue-{ISSUE_NUMBER}): add {repo_path}",
                         content=content,
-                        branch=safe_branch
+                        branch=safe_branch,
                     )
                 else:
                     raise
@@ -205,7 +219,7 @@ def create_github_pr(branch_name: str, pr_title: str, pr_body: str) -> str:
             title=pr_title,
             body=full_pr_body,
             head=safe_branch,
-            base=default_branch
+            base=default_branch,
         )
 
         issue = repo.get_issue(number=ISSUE_NUMBER)
@@ -228,7 +242,7 @@ product_manager = Agent(
     tools=[file_reader],
     llm=llm,
     max_iter=5,
-    verbose=True
+    verbose=True,
 )
 
 architect = Agent(
@@ -241,7 +255,7 @@ architect = Agent(
     tools=[file_reader],
     llm=llm,
     max_iter=5,
-    verbose=True
+    verbose=True,
 )
 
 developer = Agent(
@@ -254,7 +268,7 @@ developer = Agent(
     tools=[file_reader, safe_write_file],
     llm=llm,
     max_iter=8,
-    verbose=True
+    verbose=True,
 )
 
 qa_security_engineer = Agent(
@@ -267,7 +281,7 @@ qa_security_engineer = Agent(
     tools=[file_reader, safe_write_file, run_quality_gate],
     llm=llm,
     max_iter=10,
-    verbose=True
+    verbose=True,
 )
 
 devops_engineer = Agent(
@@ -277,7 +291,7 @@ devops_engineer = Agent(
     tools=[create_github_pr],
     llm=llm,
     max_iter=4,
-    verbose=True
+    verbose=True,
 )
 
 # ---------------------------------------------------------
@@ -290,7 +304,7 @@ task_prd = Task(
         "Do not call directory listing tools unless you need to read a specific file listed above."
     ),
     expected_output="Structured functional requirements and 5 edge-case acceptance criteria.",
-    agent=product_manager
+    agent=product_manager,
 )
 
 task_arch = Task(
@@ -304,7 +318,7 @@ task_arch = Task(
     ),
     expected_output="Technical architecture spec with exact repository file paths, import paths, and method signatures.",
     context=[task_prd],
-    agent=architect
+    agent=architect,
 )
 
 task_dev = Task(
@@ -315,7 +329,7 @@ task_dev = Task(
     ),
     expected_output="List of saved source file paths and their implemented classes/functions.",
     context=[task_prd, task_arch],
-    agent=developer
+    agent=developer,
 )
 
 task_qa = Task(
@@ -329,7 +343,7 @@ task_qa = Task(
     ),
     expected_output="Verified Run Quality Gate output confirming OVERALL_PASSED: True.",
     context=[task_prd, task_arch, task_dev],
-    agent=qa_security_engineer
+    agent=qa_security_engineer,
 )
 
 task_devops = Task(
@@ -340,11 +354,11 @@ task_devops = Task(
     ),
     expected_output="Live GitHub Pull Request URL.",
     context=[task_prd, task_qa],
-    agent=devops_engineer
+    agent=devops_engineer,
 )
 
 # ---------------------------------------------------------
-# 5. Execute the Autonomous Team
+# 5. Execute the Autonomous Team with 429 Cooldown Recovery
 # ---------------------------------------------------------
 if __name__ == "__main__":
     current_tree = get_repo_tree(".")
@@ -355,13 +369,26 @@ if __name__ == "__main__":
         max_rpm=5,
         step_callback=rate_limit_pause,
         task_callback=rate_limit_pause,
-        verbose=True
+        verbose=True,
     )
 
-    result = dev_team.kickoff(inputs={
+    inputs = {
         "repo_tree": current_tree,
         "issue_number": ISSUE_NUMBER,
         "issue_title": ISSUE_TITLE,
-        "issue_body": ISSUE_BODY
-    })
-    print("\n=== AUTONOMOUS BUILD COMPLETE ===\n", result)
+        "issue_body": ISSUE_BODY,
+    }
+
+    for attempt in range(1, 4):
+        try:
+            result = dev_team.kickoff(inputs=inputs)
+            print("\n=== AUTONOMOUS BUILD COMPLETE ===\n", result)
+            break
+        except Exception as err:
+            if "429" in str(err) or "RESOURCE_EXHAUSTED" in str(err):
+                if attempt == 3:
+                    raise
+                print(f"\n[Rate Limit Hit] Cooling down 65s before attempt {attempt + 1}/3...\n")
+                time.sleep(65)
+            else:
+                raise
