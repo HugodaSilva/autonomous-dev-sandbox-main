@@ -1,0 +1,6 @@
+crewai[google-genai]
+crewai-tools
+pytest
+PyGithub
+ruff
+bandit
