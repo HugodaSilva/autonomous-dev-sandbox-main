@@ -4,3 +4,4 @@ pytest
 PyGithub
 ruff
 bandit
+pydantic>=2.0
