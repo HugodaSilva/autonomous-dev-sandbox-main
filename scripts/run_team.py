@@ -18,9 +18,11 @@ ISSUE_BODY = os.environ.get("ISSUE_BODY", "")
 
 PROTECTED_PREFIXES = (".git", ".github", "scripts", "__pycache__", ".pytest_cache", ".ruff_cache")
 
-def rate_limit_pause(step_output):
-    """Pauses briefly between agent steps to stay under Gemini's 15 RPM Free Tier cap."""
+
+def rate_limit_pause(_output=None):
+    """Pauses between agent steps and tasks to stay safely under Gemini's 15 RPM Free Tier cap."""
     time.sleep(6)
+
 
 def get_repo_tree(root_dir: str = ".") -> str:
     """Returns a list of existing editable files in the repository."""
@@ -33,10 +35,25 @@ def get_repo_tree(root_dir: str = ".") -> str:
                 paths.append(rel_path)
     return "\n".join(paths) if paths else "(Empty repository - no source files yet)"
 
+
+def strip_markdown_fences(content: str) -> str:
+    """Removes accidental ```python ... ``` wrappers emitted by LLMs."""
+    stripped = content.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        return "\n".join(lines) + "\n"
+    return content
+
+
 llm = LLM(
     model="gemini/gemini-3.1-flash-lite-preview",
-    temperature=0.2,
-    max_retries=5
+    temperature=0.1,
+    max_retries=6,
+    timeout=120
 )
 
 # ---------------------------------------------------------
@@ -45,21 +62,49 @@ llm = LLM(
 dir_reader = DirectoryReadTool(directory=".")
 file_reader = FileReadTool()
 
+
 @tool("Safe File Writer")
 def safe_write_file(file_path: str, content: str) -> str:
-    """Creates or updates a file at the exact repository path (e.g. src/models/service_schema.py)."""
+    """Creates or updates a file at the exact repository path (e.g. src/catalog/repository.py)."""
     clean_path = os.path.normpath(file_path).lstrip("/")
     if clean_path.startswith(PROTECTED_PREFIXES) or clean_path == "requirements.txt":
         return f"ERROR: '{clean_path}' is a protected orchestration file and cannot be modified."
 
-    os.makedirs(os.path.dirname(clean_path) or ".", exist_ok=True)
+    dir_name = os.path.dirname(clean_path)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
+        # Ensure every intermediate Python package directory has an __init__.py so pytest imports work reliably
+        if clean_path.endswith(".py"):
+            parts = dir_name.split(os.sep)
+            for i in range(1, len(parts) + 1):
+                pkg_dir = os.sep.join(parts[:i])
+                init_file = os.path.join(pkg_dir, "__init__.py")
+                if not os.path.exists(init_file):
+                    with open(init_file, "w", encoding="utf-8") as init_f:
+                        init_f.write("")
+
+    clean_content = strip_markdown_fences(content) if clean_path.endswith(".py") else content
     with open(clean_path, "w", encoding="utf-8") as f:
-        f.write(content)
-    return f"SUCCESS: Wrote {len(content)} bytes to '{clean_path}'."
+        f.write(clean_content)
+    return f"SUCCESS: Wrote {len(clean_content)} bytes to '{clean_path}'."
+
 
 @tool("Run Quality Gate")
 def run_quality_gate(target_dir: str = ".") -> str:
-    """Runs Ruff linter, Bandit security scanner, and Pytest across the repository."""
+    """Auto-formats with Ruff, then runs Ruff linter, Bandit security scanner, and Pytest."""
+    # Step 1: Auto-fix import sorting (I001) and formatting so the agent doesn't burn RPM on trivial style fixes
+    subprocess.run(
+        ["ruff", "check", "--fix", target_dir, "--exclude", "scripts,.github"],
+        capture_output=True,
+        text=True
+    )
+    subprocess.run(
+        ["ruff", "format", target_dir, "--exclude", "scripts,.github"],
+        capture_output=True,
+        text=True
+    )
+
+    # Step 2: Run strict verification checks
     ruff_res = subprocess.run(
         ["ruff", "check", target_dir, "--exclude", "scripts,.github"],
         capture_output=True,
@@ -70,10 +115,17 @@ def run_quality_gate(target_dir: str = ".") -> str:
         capture_output=True,
         text=True
     )
+
+    # Ensure repository root is on PYTHONPATH so `from src.pkg.mod import ...` always resolves
+    pytest_env = os.environ.copy()
+    existing_pythonpath = pytest_env.get("PYTHONPATH", "")
+    pytest_env["PYTHONPATH"] = f".:{existing_pythonpath}" if existing_pythonpath else "."
+
     pytest_res = subprocess.run(
         ["pytest", "-v", "--ignore=scripts"],
         capture_output=True,
-        text=True
+        text=True,
+        env=pytest_env
     )
 
     overall_passed = (
@@ -88,6 +140,7 @@ def run_quality_gate(target_dir: str = ".") -> str:
         f"--- BANDIT SECURITY (Exit {bandit_res.returncode}) ---\n{bandit_res.stdout}{bandit_res.stderr}\n"
         f"--- PYTEST SUITE (Exit {pytest_res.returncode}) ---\n{pytest_res.stdout}{pytest_res.stderr}"
     )
+
 
 @tool("Ship Code via GitHub PR")
 def create_github_pr(branch_name: str, pr_title: str, pr_body: str) -> str:
@@ -115,7 +168,8 @@ def create_github_pr(branch_name: str, pr_title: str, pr_body: str) -> str:
         default_branch = repo.default_branch
         source_branch = repo.get_branch(default_branch)
 
-        safe_branch = f"ai/issue-{ISSUE_NUMBER}-{re.sub(r'[^a-zA-Z0-9-]', '-', branch_name)[:30]}"
+        safe_slug = re.sub(r"[^a-zA-Z0-9-]", "-", branch_name).strip("-")[:30] or "feature"
+        safe_branch = f"ai/issue-{ISSUE_NUMBER}-{safe_slug}"
         repo.create_git_ref(ref=f"refs/heads/{safe_branch}", sha=source_branch.commit.sha)
 
         uploaded_files = []
@@ -163,24 +217,30 @@ def create_github_pr(branch_name: str, pr_title: str, pr_body: str) -> str:
     except Exception as e:
         return f"ERROR creating PR: {str(e)}"
 
+
 # ---------------------------------------------------------
 # 3. Define the 5 Autonomous Agents
 # ---------------------------------------------------------
 product_manager = Agent(
     role="Product Manager",
     goal="Convert GitHub Issue requirements into clear functional specs and edge-case acceptance criteria.",
-    backstory="You are a technical PM who defines unambiguous requirements and edge cases.",
-    tools=[dir_reader, file_reader],
+    backstory="You are a technical PM who defines unambiguous requirements and edge cases without redundant file scans.",
+    tools=[file_reader],
     llm=llm,
+    max_iter=5,
     verbose=True
 )
 
 architect = Agent(
     role="System Architect",
     goal="Design modular Python file structures, classes, and exact function signatures at the target repo paths.",
-    backstory="You are a senior software architect who ensures modules are cleanly decoupled, testable, and placed at exact repository paths.",
-    tools=[dir_reader, file_reader],
+    backstory=(
+        "You are a senior software architect who ensures modules are cleanly decoupled, testable, "
+        "and use absolute root-relative imports (e.g., `from src.catalog.models import ...`)."
+    ),
+    tools=[file_reader],
     llm=llm,
+    max_iter=5,
     verbose=True
 )
 
@@ -188,11 +248,12 @@ developer = Agent(
     role="Backend Python Developer",
     goal="Write clean, PEP-8 compliant, secure Python code and save it directly to the target repo paths using Safe File Writer.",
     backstory=(
-        "You are a senior Python engineer. Before modifying any existing file, read it first with FileReadTool. "
-        "You always output raw, valid Python code with zero markdown fences or unused imports."
+        "You are a senior Python engineer. Read existing target files first if they already appear in the repo tree. "
+        "Always use absolute root-relative imports (e.g., `from src.pkg.module import Class`) and output complete, valid Python code."
     ),
-    tools=[dir_reader, file_reader, safe_write_file],
+    tools=[file_reader, safe_write_file],
     llm=llm,
+    max_iter=8,
     verbose=True
 )
 
@@ -200,11 +261,12 @@ qa_security_engineer = Agent(
     role="QA & AppSec Automation Engineer",
     goal="Write pytest suites, run Run Quality Gate (Ruff, Bandit, Pytest), and fix all issues until OVERALL_PASSED is True.",
     backstory=(
-        "You enforce strict quality gates. You never pass code with linter warnings, security vulnerabilities, "
-        "or failing tests. When Run Quality Gate reports failures, you read and patch the files with Safe File Writer and re-run until OVERALL_PASSED: True."
+        "You enforce strict quality gates. Write clean pytest tests using root-relative imports "
+        "(e.g., `from src.pkg.module import ...`), execute Run Quality Gate once, and patch only reported failures."
     ),
-    tools=[dir_reader, file_reader, safe_write_file, run_quality_gate],
+    tools=[file_reader, safe_write_file, run_quality_gate],
     llm=llm,
+    max_iter=10,
     verbose=True
 )
 
@@ -214,6 +276,7 @@ devops_engineer = Agent(
     backstory="You manage CI/CD releases and only ship code after QA confirms OVERALL_PASSED: True.",
     tools=[create_github_pr],
     llm=llm,
+    max_iter=4,
     verbose=True
 )
 
@@ -223,7 +286,8 @@ devops_engineer = Agent(
 task_prd = Task(
     description=(
         "Current repository files:\n{repo_tree}\n\n"
-        "Write a concise PRD for GitHub Issue #{issue_number} - '{issue_title}':\n{issue_body}"
+        "Write a concise PRD for GitHub Issue #{issue_number} - '{issue_title}':\n{issue_body}\n"
+        "Do not call directory listing tools unless you need to read a specific file listed above."
     ),
     expected_output="Structured functional requirements and 5 edge-case acceptance criteria.",
     agent=product_manager
@@ -232,40 +296,50 @@ task_prd = Task(
 task_arch = Task(
     description=(
         "Based on the PRD and existing repository files ({repo_tree}), define the exact repository file paths "
-        "requested by the GitHub Issue (for example, `src/models/service_schema.py` and `src/models/__init__.py`). "
-        "Do NOT use a `project/` wrapper folder. Specify class names, method signatures, and validation rules."
+        "requested by GitHub Issue #{issue_number} ('{issue_title}').\n"
+        "Rules:\n"
+        "- Follow the exact folder paths specified in the issue (e.g., `src/...`). Never create a `project/` wrapper.\n"
+        "- Specify absolute root-relative Python imports (e.g., `from src.module import ...`) across all files.\n"
+        "- Specify class names, method signatures, type hints, and validation rules."
     ),
-    expected_output="Technical architecture spec with exact repository file paths and method signatures.",
+    expected_output="Technical architecture spec with exact repository file paths, import paths, and method signatures.",
+    context=[task_prd],
     agent=architect
 )
 
 task_dev = Task(
     description=(
-        "Implement the Python modules following the architecture spec at the exact repository paths "
-        "(e.g., `src/models/service_schema.py` and `src/models/__init__.py`). "
-        "Save raw, valid Python code (NO ```python markdown fences) using `Safe File Writer`."
+        "Implement the Python modules following the architecture spec at the exact repository paths. "
+        "Use `Safe File Writer` to save complete, valid Python code with proper type hints, docstrings, and "
+        "root-relative imports. List every file written and its public signatures in your final response."
     ),
-    expected_output="Confirmation that source files are saved at the target repository paths.",
+    expected_output="List of saved source file paths and their implemented classes/functions.",
+    context=[task_prd, task_arch],
     agent=developer
 )
 
 task_qa = Task(
     description=(
-        "1. Read all created/modified source files using `FileReadTool`.\n"
-        "2. Write a comprehensive pytest test suite under `tests/` (e.g., `tests/test_issue_{issue_number}.py`) using `Safe File Writer` (raw Python only, no markdown fences).\n"
-        "3. Execute `Run Quality Gate` on `.`.\n"
-        "4. If OVERALL_PASSED is False, fix all Ruff lint warnings, Bandit security issues, or Pytest failures using `Safe File Writer` and re-run `Run Quality Gate` until OVERALL_PASSED is True."
+        "1. Review the implemented modules from the developer's summary (read files with `FileReadTool` only if details are missing).\n"
+        "2. Write a comprehensive pytest test suite at `tests/test_issue_{issue_number}.py` using `Safe File Writer`.\n"
+        "   - Import modules using root-relative paths (e.g., `from src.pkg.mod import ...`).\n"
+        "   - Cover normal behavior and all 5 edge-case acceptance criteria from the PRD.\n"
+        "3. Execute `Run Quality Gate` on `.` (note: Ruff auto-fix and format run automatically inside the tool).\n"
+        "4. If OVERALL_PASSED is False, fix only the specific Ruff, Bandit, or Pytest errors using `Safe File Writer` and re-run `Run Quality Gate` until OVERALL_PASSED is True."
     ),
     expected_output="Verified Run Quality Gate output confirming OVERALL_PASSED: True.",
+    context=[task_prd, task_arch, task_dev],
     agent=qa_security_engineer
 )
 
 task_devops = Task(
     description=(
-        "Once QA confirms OVERALL_PASSED: True, use `Ship Code via GitHub PR` with a short descriptive slug "
-        "(e.g., `domain-models`) to commit all new/modified repository files and open a Pull Request summarizing the feature, security scan, and test results."
+        "Once QA confirms OVERALL_PASSED: True, call `Ship Code via GitHub PR` with a short descriptive slug "
+        "(e.g., `catalog-repo`) to commit all new/modified repository files and open a Pull Request summarizing "
+        "the feature, security scan, and test results."
     ),
     expected_output="Live GitHub Pull Request URL.",
+    context=[task_prd, task_qa],
     agent=devops_engineer
 )
 
@@ -280,6 +354,7 @@ if __name__ == "__main__":
         process=Process.sequential,
         max_rpm=5,
         step_callback=rate_limit_pause,
+        task_callback=rate_limit_pause,
         verbose=True
     )
 
